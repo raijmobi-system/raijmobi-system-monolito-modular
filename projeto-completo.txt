@@ -1,0 +1,2138 @@
+
+===== ./docker-compose.yml =====
+services:
+  postgres:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile.postgres
+    container_name: raiji-postgres
+    environment:
+      POSTGRES_USER: raiji
+      POSTGRES_PASSWORD: raiji123
+      POSTGRES_DB: raiji_keycloak
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raiji -d raiji_keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  # ---------------------------------------------------------------------------
+  # 2) KEYCLOAK
+  # ---------------------------------------------------------------------------
+  keycloak:
+    build:
+      context: ./keycloak
+      dockerfile: Dockerfile.keycloak
+    container_name: raiji-keycloak
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/raiji_keycloak
+      KC_DB_USERNAME: raiji
+      KC_DB_PASSWORD: raiji123
+    ports:
+      - "8180:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Healthcheck removido: a imagem 26.0 é distroless e não tem ferramentas para testar HTTP
+
+  # ---------------------------------------------------------------------------
+  # 3) APP
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: raiji-app
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_started # Mudou de service_healthy para service_started
+    # O container da app TEM curl (instalado no Dockerfile.app).
+    # Este entrypoint espera o Keycloak responder antes de iniciar o Java.
+    entrypoint: >
+      /bin/sh -c "
+      while ! curl -s http://keycloak:8080/realms/raiji > /dev/null; do
+        echo 'Aguardando Keycloak iniciar...';
+        sleep 5;
+      done;
+      echo 'Keycloak pronto! Iniciando aplicação...';
+      exec java -jar app.jar"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+
+
+volumes:
+  postgres-data:
+
+
+===== ./Dockerfile.app =====
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /build
+
+COPY pom.xml ./
+COPY raiji-common/pom.xml ./raiji-common/
+COPY raiji-security/pom.xml ./raiji-security/
+COPY raiji-users/pom.xml ./raiji-users/
+COPY raiji-app/pom.xml ./raiji-app/
+RUN mvn -B dependency:go-offline || true
+
+COPY raiji-common/src ./raiji-common/src
+COPY raiji-security/src ./raiji-security/src
+COPY raiji-users/src ./raiji-users/src
+COPY raiji-app/src ./raiji-app/src
+RUN mvn -B clean package -DskipTests
+
+FROM eclipse-temurin:21-jre AS runtime
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /build/raiji-app/target/raiji-app.jar ./app.jar
+
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+
+===== ./Dockerfile.app.dockerignore =====
+.git
+.gitignore
+.idea
+.vscode
+*.iml
+**/target
+keycloak
+postgres
+docker-compose.yml
+Dockerfile.app
+Dockerfile.app.dockerignore
+data
+logs
+*.log
+
+
+===== ./.github/workflows/raiji-tests.yml =====
+name: Raiji — CI (testes automatizados)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 21 + cache do Maven
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Executar todos os testes + cobertura
+        run: mvn -B clean verify
+
+      - name: Exibir catálogo vivo da API no log
+        if: always()
+        run: cat raiji-app/target/api-catalog.txt || true
+
+      - name: Anexar relatórios (cobertura + resultados + catálogo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raiji-relatorios-de-teste
+          path: |
+            raiji-app/target/api-catalog.txt
+            raiji-app/target/site/jacoco-aggregate/**
+            **/target/surefire-reports/*.txt
+            **/target/failsafe-reports/*.txt
+          if-no-files-found: ignore
+
+
+===== ./.gitignore =====
+target/
+.idea/
+.vscode/
+*.iml
+.settings/
+.classpath
+.project
+.DS_Store
+Thumbs.db
+logs/
+*.log
+data/
+.env
+
+
+===== ./keycloak/Dockerfile.keycloak =====
+FROM quay.io/keycloak/keycloak:26.0.5
+
+# A imagem 26.0 é distroless (não tem apt-get/microdnf).
+# Apenas copiamos o realm e iniciamos o servidor.
+USER root
+COPY --chown=keycloak:keycloak raiji-realm.json /opt/keycloak/data/import/raiji-realm.json
+
+USER keycloak
+EXPOSE 8080
+CMD ["start-dev", "--import-realm"]
+
+===== ./keycloak/Dockerfile.keycloak.dockerignore =====
+*
+!raiji-realm.json
+
+
+===== ./keycloak/raiji-realm.json =====
+{
+  "realm": "raiji",
+  "enabled": true,
+  "registrationAllowed": true,
+  "resetPasswordAllowed": true,
+  "rememberMe": true,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "roles": {
+    "realm": [
+      { "name": "DRIVER" },
+      { "name": "PASSENGER" },
+      { "name": "admin" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "raiji-api",
+      "name": "Raiji API (frontend e apps)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:3000/*", "http://localhost:5173/*", "http://localhost:8080/*"],
+      "webOrigins": ["+"],
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic"],
+      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"]
+    },
+    {
+      "clientId": "raiji-admin",
+      "name": "Raiji Admin (service account do monolito)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "raiji-admin-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-raiji-admin",
+      "enabled": true,
+      "serviceAccountClientId": "raiji-admin",
+      "clientRoles": {
+        "realm-management": ["manage-users", "view-users", "query-users","view-realm"]
+      }
+    },
+    {
+      "username": "teste",
+      "enabled": true,
+      "email": "teste@raiji.com",
+      "emailVerified": true,
+      "firstName": "Usuario",
+      "lastName": "Teste",
+      "credentials": [
+        { "type": "password", "value": "teste123", "temporary": false }
+      ]
+    }
+  ]
+}
+
+
+===== ./pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.0</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.raiji</groupId>
+    <artifactId>raiji-parent</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>Raiji :: Parent</name>
+
+    <modules>
+        <module>raiji-common</module>
+        <module>raiji-security</module>
+        <module>raiji-users</module>
+        <module>raiji-app</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.raiji</groupId>
+                <artifactId>raiji-common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.raiji</groupId>
+                <artifactId>raiji-security</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.raiji</groupId>
+                <artifactId>raiji-users</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>
+
+
+===== ./postgres/Dockerfile.postgres =====
+FROM postgres:17-alpine
+COPY init/ /docker-entrypoint-initdb.d/
+
+
+===== ./postgres/Dockerfile.postgres.dockerignore =====
+*
+!init
+!init/**
+
+
+===== ./postgres/init/01-create-databases.sql =====
+CREATE DATABASE raiji_app;
+
+
+===== ./projeto-completo.txt =====
+
+
+===== ./raiji-app/pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.raiji</groupId>
+        <artifactId>raiji-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>raiji-app</artifactId>
+    <name>Raiji :: App</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.raiji</groupId>
+            <artifactId>raiji-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.raiji</groupId>
+            <artifactId>raiji-users</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.rest-assured</groupId>
+            <artifactId>rest-assured</artifactId>
+            <version>5.4.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.github.dasniko</groupId>
+            <artifactId>testcontainers-keycloak</artifactId>
+            <version>3.6.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy-agent</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <properties>
+        <coverage.minimum>0.80</coverage.minimum>
+        <argLine>--add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED</argLine>
+        <byte-buddy.version>1.17.5</byte-buddy.version>
+    </properties>
+
+    <build>
+    <finalName>raiji-app</finalName>
+    <plugins>
+        <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+        </plugin>
+
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+                <argLine>@{argLine} -javaagent:${settings.localRepository}/net/bytebuddy/byte-buddy-agent/${byte-buddy.version}/byte-buddy-agent-${byte-buddy.version}.jar</argLine>
+                <environmentVariables>
+                    <DOCKER_API_VERSION>1.45</DOCKER_API_VERSION>
+                </environmentVariables>
+            </configuration>
+        </plugin>
+
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+                <environmentVariables>
+                    <DOCKER_API_VERSION>1.45</DOCKER_API_VERSION>
+                </environmentVariables>
+            </configuration>
+            <executions>
+                <execution>
+                    <id>testes-api-e2e</id>
+                    <goals>
+                        <goal>integration-test</goal>
+                        <goal>verify</goal>
+                    </goals>
+                </execution>
+            </executions>
+        </plugin>
+
+        <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <version>0.8.12</version>
+            <executions>
+                <execution>
+                    <id>agente</id>
+                    <goals><goal>prepare-agent</goal></goals>
+                </execution>
+                <execution>
+                    <id>relatorio-agregado</id>
+                    <phase>verify</phase>
+                    <goals><goal>report-aggregate</goal></goals>
+                </execution>
+                <execution>
+                    <id>meta-cobertura</id>
+                    <phase>verify</phase>
+                    <goals><goal>check</goal></goals>
+                    <configuration>
+                        <excludes>
+                            <exclude>**/RaijiApplication.class</exclude>
+                        </excludes>
+                        <rules>
+                            <rule>
+                                <element>BUNDLE</element>
+                                <limits>
+                                    <limit>
+                                        <counter>LINE</counter>
+                                        <value>COVEREDRATIO</value>
+                                        <minimum>${coverage.minimum}</minimum>
+                                    </limit>
+                                </limits>
+                            </rule>
+                        </rules>
+                    </configuration>
+                </execution>
+            </executions>
+        </plugin>
+    </plugins>
+</build>
+</project>
+
+
+===== ./raiji-app/src/main/java/com/raiji/RaijiApplication.java =====
+package com.raiji;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class RaijiApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(RaijiApplication.class, args);
+    }
+}
+
+
+===== ./raiji-app/src/main/java/com/raiji/web/MeController.java =====
+package com.raiji.web;
+
+import java.util.HashMap;   // ← ADICIONAR
+
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api")
+public class MeController {
+
+    @GetMapping("/me")
+    public Map<String, Object> me(@AuthenticationPrincipal Jwt jwt) {
+        Map<String, Object> realmAccess = jwt.getClaimAsMap("realm_access");
+
+        Map<String, Object> resposta = new HashMap<>();
+        resposta.put("sub", jwt.getSubject());
+        resposta.put("email", jwt.getClaimAsString("email"));   // pode ser null
+        resposta.put("name", jwt.getClaimAsString("name"));     // pode ser null
+        resposta.put("realmRoles", realmAccess == null
+                ? List.of()
+                : realmAccess.getOrDefault("roles", List.of()));
+
+        return resposta;
+    }
+
+    @GetMapping("/admin/ping")
+    @PreAuthorize("hasRole('admin')")
+    public Map<String, String> adminPing() {
+        return Map.of("message", "Voce tem a role admin do realm raiji");
+    }
+}
+
+
+===== ./raiji-app/src/main/resources/application-docker.yml =====
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/raiji_app
+    username: raiji
+    password: raiji123
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://keycloak:8080/realms/raiji/protocol/openid-connect/certs
+
+raiji:
+  keycloak:
+    base-url: http://keycloak:8080
+    realm: raiji
+
+
+===== ./raiji-app/src/main/resources/application.yml =====
+server:
+  port: 8080
+
+spring:
+  application:
+    name: raiji
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/raiji_app
+    username: raiji
+    password: raiji123
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8180/realms/raiji/protocol/openid-connect/certs
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+raiji:
+  keycloak:
+    base-url: http://localhost:8180
+    realm: raiji
+    admin-client-id: raiji-admin
+    admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:raiji-admin-secret}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/ApiCatalogIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Supplier;
+
+import io.restassured.http.ContentType;
+import io.restassured.response.Response;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Documentação viva — catálogo de todas as requisições da API")
+class ApiCatalogIT extends RaijiTestSupport {
+
+    //private static final String SENHA_NOVOS_USUARIOS_NOVOS_USUARIOS = "Catalogo@Raiji123";
+    private static final int LIMITE_CORPO = 280;
+
+    private record Endpoint(String metodo, String rota, String autenticacao,
+                            String responsabilidade, Supplier<Response> chamada) {}
+
+    @Test
+    @DisplayName("CT-DOC: executa todas as requisições e registra o retorno de sucesso de cada uma")
+    void catalogoVivoDaApi() throws IOException {
+        String usuario = "catalogo-" + System.currentTimeMillis();
+        String userId = criarUsuario(usuario);
+        String token = obterToken(usuario, SENHA_NOVOS_USUARIOS);
+
+        List<Endpoint> endpoints = List.of(
+            new Endpoint("POST", "/realms/raiji/protocol/openid-connect/token",
+                "pública (credenciais no corpo)",
+                "LOGIN — troca usuário/SENHA_NOVOS_USUARIOS por access_token (JWT RS256) e refresh_token (RN21)",
+                () -> given().contentType(ContentType.URLENC)
+                        .formParam("grant_type", "password")
+                        .formParam("client_id", CLIENTE_API)
+                        .formParam("username", usuario)
+                        .formParam("password", SENHA_NOVOS_USUARIOS)
+                        .when().post(urlToken())),
+
+            new Endpoint("GET", "/realms/raiji",
+                "pública",
+                "METADADOS DO REALM — emissor dos tokens; recursos habilitados (registro e recuperação de SENHA_NOVOS_USUARIOS — RF35)",
+                () -> given().when().get(kc("/realms/raiji"))),
+
+            new Endpoint("GET", "/realms/raiji/protocol/openid-connect/certs",
+                "pública",
+                "JWKS — chaves públicas com que o monolito valida a assinatura de todo JWT localmente (RN21)",
+                () -> given().when().get(kc("/realms/raiji/protocol/openid-connect/certs"))),
+
+            new Endpoint("GET", "/actuator/health",
+                "pública",
+                "HEALTHCHECK da aplicação — endereço usado pelo Docker Compose e por orquestradores",
+                () -> given().when().get(app("/actuator/health"))),
+
+            new Endpoint("GET", "/api/me",
+                "Bearer token (JWT)",
+                "IDENTIDADE — sub, e-mail, nome e realmRoles do usuário autenticado, lidos do token",
+                () -> given().auth().oauth2(token).when().get(app("/api/me"))),
+
+            new Endpoint("GET", "/api/users/me",
+                "Bearer token (JWT)",
+                "PERFIL DE NEGÓCIO — consulta e, no 1º acesso, provisiona o registro no banco (RN20)",
+                () -> given().auth().oauth2(token).when().get(app("/api/users/me"))),
+
+            new Endpoint("POST", "/api/users/me/profile",
+                "Bearer token (JWT)",
+                "DEFINIR O PERFIL — DRIVER/PASSENGER; grava no banco e sincroniza a realm role no Keycloak (RN01/RF34)",
+                () -> given().auth().oauth2(token).contentType(ContentType.JSON)
+                        .body("{\"role\":\"PASSENGER\"}")
+                        .when().post(app("/api/users/me/profile"))),
+
+            new Endpoint("GET", "/api/admin/ping",
+                "Bearer token (JWT) + realm role admin",
+                "ÁREA ADMINISTRATIVA — protegida por autorização; sem a role admin responde 403 (RN22)",
+                () -> {
+                    atribuirRoleRealm(userId, "admin");
+                    return given().auth().oauth2(obterToken(usuario, SENHA_NOVOS_USUARIOS))
+                            .when().get(app("/api/admin/ping"));
+                })
+        );
+
+        StringBuilder saida = new StringBuilder();
+        saida.append("""
+                ================================================================================
+                RAIJI — CATÁLOGO VIVO DA API — %s
+                Gerado pelos testes (JUnit 5 + REST Assured + Testcontainers) contra a
+                aplicação REAL. Cada bloco traz a RESPONSABILIDADE do endpoint e a
+                resposta observada quando bem-sucedida.
+                ================================================================================
+
+                """.formatted(LocalDateTime.now()));
+
+        List<String> falhas = new ArrayList<>();
+        int sucesso = 0;
+        int n = 1;
+
+        for (Endpoint e : endpoints) {
+            Response resposta = e.chamada().get();
+            int status = resposta.getStatusCode();
+            if (status >= 200 && status < 300) sucesso++;
+            else falhas.add("%s %s → HTTP %d".formatted(e.metodo(), e.rota(), status));
+
+            saida.append("[%d] %s %s%n".formatted(n++, e.metodo(), e.rota()));
+            saida.append("    autenticação ....: %s%n".formatted(e.autenticacao()));
+            saida.append("    responsável por .: %s%n".formatted(e.responsabilidade()));
+            saida.append("    sucesso .........: HTTP %d%n".formatted(status));
+            saida.append("    resposta ........: %s%n%n".formatted(corpoResumido(resposta)));
+        }
+
+        saida.append("-".repeat(80)).append(System.lineSeparator());
+        saida.append("TOTAL: %d endpoints | com sucesso (2xx): %d | sem sucesso: %d%n"
+                .formatted(endpoints.size(), sucesso, falhas.size()));
+
+        System.out.println(saida);
+        Files.writeString(Path.of("target", "api-catalog.txt"), saida, StandardCharsets.UTF_8);
+
+        assertThat(falhas).as("endpoints que não responderam com sucesso (2xx)").isEmpty();
+    }
+
+    private static String corpoResumido(Response resposta) {
+        String corpo = resposta.getBody().asString()
+                .replaceAll("(\"(?:access_token|refresh_token|id_token)\":\")[^\"]*\"",
+                        "$1***mascarado***\"");
+        return corpo.length() <= LIMITE_CORPO ? corpo : corpo.substring(0, LIMITE_CORPO) + " …(truncado)";
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/AutenticacaoApiIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
+
+import io.restassured.http.ContentType;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Testes de API (§5) — autenticação (RN21)")
+class AutenticacaoApiIT extends RaijiTestSupport {
+
+    @Test
+    @DisplayName("CT-003: POST /token com credenciais válidas → 200 + access_token")
+    void ct003_loginValido() {
+        given().contentType(ContentType.URLENC)
+                .formParam("grant_type", "password")
+                .formParam("client_id", CLIENTE_API)
+                .formParam("username", USUARIO_TESTE)
+                .formParam("password", SENHA_TESTE)
+                .when().post(urlToken())
+                .then().statusCode(200)
+                .body("access_token", notNullValue())
+                .body("token_type", equalTo("Bearer"))
+                .body("expires_in", notNullValue());
+    }
+
+    @Test
+    @DisplayName("CT-004: POST /token com senha incorreta → 401 + invalid_grant")
+    void ct004_senhaIncorreta() {
+        given().contentType(ContentType.URLENC)
+                .formParam("grant_type", "password")
+                .formParam("client_id", CLIENTE_API)
+                .formParam("username", USUARIO_TESTE)
+                .formParam("password", "senha-errada")
+                .when().post(urlToken())
+                .then().statusCode(401)
+                .body("error", equalTo("invalid_grant"));
+    }
+
+    @Test
+    @DisplayName("CT-005: GET /api/me sem token → 401")
+    void ct005_semToken() {
+        given().when().get(app("/api/me")).then().statusCode(401);
+    }
+
+    @Test
+    @DisplayName("CT-006 (RN21): token com assinatura adulterada → 401 (validação local via JWKS)")
+    void ct006_tokenAdulterado() {
+        String token = adulterarAssinatura(obterToken(USUARIO_TESTE, SENHA_TESTE));
+        given().auth().oauth2(token)
+                .when().get(app("/api/me"))
+                .then().statusCode(401);
+    }
+
+    @Test
+    @DisplayName("CT-007: GET /api/me → sub, e-mail e realmRoles do JWT")
+    void ct007_identidade() {
+        given().auth().oauth2(obterToken(USUARIO_TESTE, SENHA_TESTE))
+                .when().get(app("/api/me"))
+                .then().statusCode(200)
+                .body("sub", notNullValue())
+                .body("email", equalTo("teste@raiji.com"))
+                .body("realmRoles", notNullValue());
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/AutorizacaoAdminApiIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Testes de API (§5) — autorização (RN22)")
+class AutorizacaoAdminApiIT extends RaijiTestSupport {
+
+    @Test
+    @DisplayName("CT-020: GET /api/admin/ping sem token → 401")
+    void ct020_semToken() {
+        given().when().get(app("/api/admin/ping")).then().statusCode(401);
+    }
+
+    @Test
+    @DisplayName("CT-019 (RN22): sem a role admin → 403; com a role atribuída via Admin REST → 200")
+    void ct019_roleAdmin() {
+        String usuario = "admin-it-" + System.currentTimeMillis();
+        String userId = criarUsuario(usuario);
+        String token = obterToken(usuario, SENHA_NOVOS_USUARIOS);
+
+        given().auth().oauth2(token)
+                .when().get(app("/api/admin/ping"))
+                .then().statusCode(403);
+
+        atribuirRoleRealm(userId, "admin");
+        String tokenAdmin = obterToken(usuario, SENHA_NOVOS_USUARIOS);
+
+        given().auth().oauth2(tokenAdmin)
+                .when().get(app("/api/admin/ping"))
+                .then().statusCode(200)
+                .body("message", containsString("admin"));
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/InfraSaudeIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.is;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Testes de API (§5) — infraestrutura e pré-condições")
+class InfraSaudeIT extends RaijiTestSupport {
+
+    @Test
+    @DisplayName("CT-001: GET /actuator/health → 200 + status UP")
+    void ct001_healthcheck() {
+        given().when().get(app("/actuator/health"))
+                .then().statusCode(200)
+                .body("status", equalTo("UP"));
+    }
+
+    @Test
+    @DisplayName("CT-002: Keycloak acessível — metadados do realm e JWKS (RN21)")
+    void ct002_keycloakAcessivel() {
+        given().when().get(kc("/realms/" + REALM))
+                .then().statusCode(200)
+                .body("realm", equalTo(REALM));
+
+        given().when().get(kc("/realms/" + REALM + "/protocol/openid-connect/certs"))
+                .then().statusCode(200)
+                .body("keys.size()", greaterThan(0));
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/JornadaCompletaE2EIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.notNullValue;
+
+import io.restassured.http.ContentType;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Teste E2E (§6.1) — jornada completa do usuário")
+class JornadaCompletaE2EIT extends RaijiTestSupport {
+
+    @Test
+    @DisplayName("CT-023: cadastro → login → identidade → 1º acesso → perfil → role no token")
+    void jornadaCompleta() {
+        String usuario = "e2e-" + System.currentTimeMillis();
+
+        passo(1, "cadastro do usuário (Admin REST, HTTP 201)");
+        criarUsuario(usuario);
+
+        passo(2, "login (password grant) → access_token");
+        String token = obterToken(usuario, SENHA_NOVOS_USUARIOS);
+
+        passo(3, "GET /api/me → identidade do usuário autenticado");
+        given().auth().oauth2(token).when().get(app("/api/me"))
+                .then().statusCode(200)
+                .body("sub", notNullValue())
+                .body("email", equalTo(usuario + "@raiji.com"));
+
+        passo(4, "GET /api/users/me → 1º acesso provisiona o perfil (RN20)");
+        given().auth().oauth2(token).when().get(app("/api/users/me"))
+                .then().statusCode(200)
+                .body("profileConfigured", is(false));
+
+        passo(5, "POST /api/users/me/profile → define PASSENGER (RN01/RF34)");
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":\"PASSENGER\"}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(200)
+                .body("profileType", equalTo("PASSENGER"));
+
+        passo(6, "novo login → token contém a role sincronizada (RF34)");
+        String novoToken = obterToken(usuario, SENHA_NOVOS_USUARIOS);
+        given().auth().oauth2(novoToken).when().get(app("/api/me"))
+                .then().statusCode(200)
+                .body("realmRoles", hasItem("PASSENGER"));
+    }
+
+    private static void passo(int n, String descricao) {
+        System.out.printf("  [CT-023] passo %d/6 — %s%n", n, descricao);
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/PerfilUsuarioApiIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
+
+import io.restassured.http.ContentType;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.TestMethodOrder;
+
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@DisplayName("Testes de API (§5) — perfil do usuário (RN01, RN20, RF34)")
+class PerfilUsuarioApiIT extends RaijiTestSupport {
+
+    private static final String USUARIO = "perfil-it-" + System.currentTimeMillis();
+    private String token;
+
+    @Test
+    @Order(1)
+    @DisplayName("CT-008: cadastro de usuário via Admin REST → 201 + id")
+    void ct008_cadastro() {
+        criarUsuario(USUARIO);
+    }
+
+    @Test
+    @Order(2)
+    @DisplayName("CT-009: usuário recém-cadastrado autentica → 200 + token")
+    void ct009_login() {
+        token = obterToken(USUARIO, SENHA_NOVOS_USUARIOS);
+        assertThat(token).isNotBlank();
+    }
+
+    @Test
+    @Order(3)
+    @DisplayName("CT-010 (RN20): 1º acesso provisiona o perfil, ainda não configurado")
+    void ct010_primeiroAcesso() {
+        given().auth().oauth2(token)
+                .when().get(app("/api/users/me"))
+                .then().statusCode(200)
+                .body("id", notNullValue())
+                .body("keycloakSub", notNullValue())
+                .body("profileType", nullValue())
+                .body("profileConfigured", is(false));
+    }
+
+    @Test
+    @Order(4)
+    @DisplayName("CT-011 (RN01/RF34): definir perfil PASSENGER → 200 + configurado")
+    void ct011_definirPerfil() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":\"PASSENGER\"}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(200)
+                .body("profileType", equalTo("PASSENGER"))
+                .body("profileConfigured", is(true));
+    }
+
+    @Test
+    @Order(5)
+    @DisplayName("CT-012 (RF34): novo login → token contém a role PASSENGER sincronizada")
+    void ct012_roleSincronizada() {
+        token = obterToken(USUARIO, SENHA_NOVOS_USUARIOS);
+        given().auth().oauth2(token)
+                .when().get(app("/api/me"))
+                .then().statusCode(200)
+                .body("realmRoles", hasItem("PASSENGER"));
+    }
+
+    @Test
+    @Order(6)
+    @DisplayName("CT-013: alterar o perfil para DRIVER → 200")
+    void ct013_trocarPerfil() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":\"DRIVER\"}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(200)
+                .body("profileType", equalTo("DRIVER"));
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("CT-014 (RF34): após a troca, token novo tem DRIVER e NÃO tem PASSENGER")
+    void ct014_trocaDeRole() {
+        token = obterToken(USUARIO, SENHA_NOVOS_USUARIOS);
+        given().auth().oauth2(token)
+                .when().get(app("/api/me"))
+                .then().statusCode(200)
+                .body("realmRoles", hasItem("DRIVER"))
+                .body("realmRoles", not(hasItem("PASSENGER")));
+    }
+
+    @Test
+    @Order(8)
+    @DisplayName("CT-015: reenviar o mesmo perfil é idempotente → 200")
+    void ct015_idempotencia() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":\"DRIVER\"}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(200)
+                .body("profileType", equalTo("DRIVER"));
+    }
+
+    @Test
+    @Order(9)
+    @DisplayName("CT-016: role fora do enum (\"PIRATE\") → 400")
+    void ct016_roleInvalida() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":\"PIRATE\"}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(10)
+    @DisplayName("CT-017: role nula (viola @NotNull) → 400")
+    void ct017_roleNula() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .body("{\"role\":null}")
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(400);
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("CT-018: requisição sem corpo → 400")
+    void ct018_semCorpo() {
+        given().auth().oauth2(token).contentType(ContentType.JSON)
+                .when().post(app("/api/users/me/profile"))
+                .then().statusCode(400);
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/it/RaijiTestSupport.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+
+import java.util.List;
+import java.util.Map;
+
+import dasniko.testcontainers.keycloak.KeycloakContainer;
+import io.restassured.http.ContentType;
+import io.restassured.common.mapper.TypeRef;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+public abstract class RaijiTestSupport {
+
+    protected static final String REALM = "raiji";
+    protected static final String CLIENTE_API = "raiji-api";
+    protected static final String USUARIO_TESTE = "teste";
+    protected static final String SENHA_TESTE = "teste123";
+    protected static final String SENHA_NOVOS_USUARIOS = "Raiji@It123";
+
+    static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>("postgres:17-alpine")
+                    .withDatabaseName("raiji_app")
+                    .withUsername("raiji")
+                    .withPassword("raiji123");
+
+    // VERSÃO ATUALIZADA PARA 26.0 (Alinhada com docker-compose.yml e Dockerfile.keycloak)
+    static final KeycloakContainer KEYCLOAK =
+            new KeycloakContainer("quay.io/keycloak/keycloak:26.0.5")
+                    .withAdminUsername("admin")
+                    .withAdminPassword("admin")
+                    .withEnv("KEYCLOAK_ADMIN", "admin")
+                    .withEnv("KEYCLOAK_ADMIN_PASSWORD", "admin")
+                    .withEnv("KC_BOOTSTRAP_ADMIN_USERNAME", "admin")
+                    .withEnv("KC_BOOTSTRAP_ADMIN_PASSWORD", "admin")
+                    .withFeaturesDisabled("organization") 
+                    .withRealmImportFile("raiji-realm.json");
+
+    // O bloco static garante que os containers subam e tenham suas portas mapeadas
+    // ANTES de qualquer contexto do Spring Boot tentar ler as propriedades dinâmicas.
+    static {
+        POSTGRES.start();
+        KEYCLOAK.start();
+    }
+
+    @LocalServerPort
+    protected int porta;
+
+    @DynamicPropertySource
+    static void registrarPropriedades(DynamicPropertyRegistry registro) {
+        // Não é mais necessário chamar .start() aqui, pois o bloco static já cuidou disso.
+        registro.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registro.add("spring.datasource.username", POSTGRES::getUsername);
+        registro.add("spring.datasource.password", POSTGRES::getPassword);
+        registro.add("spring.security.oauth2.resourceserver.jwt.jwk-set-uri",
+                () -> KEYCLOAK.getAuthServerUrl() + "/realms/" + REALM
+                        + "/protocol/openid-connect/certs");
+        registro.add("raiji.keycloak.base-url", KEYCLOAK::getAuthServerUrl);
+        registro.add("raiji.keycloak.admin-client-id", () -> "raiji-admin");
+        registro.add("raiji.keycloak.admin-client-secret", () -> "raiji-admin-secret");
+        registro.add("raiji.keycloak.realm", () -> REALM);
+    }
+
+    protected String app(String caminho) { return "http://localhost:" + porta + caminho; }
+    protected static String kc(String caminho) { return KEYCLOAK.getAuthServerUrl() + caminho; }
+    protected static String urlToken() { return kc("/realms/" + REALM + "/protocol/openid-connect/token"); }
+    protected static String urlAdmin() { return kc("/admin/realms/" + REALM); }
+
+    protected static String obterToken(String usuario, String senha) {
+        return given()
+                .contentType(ContentType.URLENC)
+                .formParam("grant_type", "password")
+                .formParam("client_id", CLIENTE_API)
+                .formParam("username", usuario)
+                .formParam("password", senha)
+                .when().post(urlToken())
+                .then().statusCode(200)
+                .extract().path("access_token");
+    }
+
+    protected static String tokenAdmin() {
+        return given()
+                .contentType(ContentType.URLENC)
+                .formParam("grant_type", "password")
+                .formParam("client_id", "admin-cli")
+                .formParam("username", KEYCLOAK.getAdminUsername())
+                .formParam("password", KEYCLOAK.getAdminPassword())
+                .when().post(kc("/realms/master/protocol/openid-connect/token"))
+                .then().statusCode(200)
+                .extract().path("access_token");
+    }
+
+    protected static String criarUsuario(String username) {
+        String admin = tokenAdmin();
+
+        String location = given()
+                .auth().oauth2(admin)
+                .contentType(ContentType.JSON)
+                .body(Map.of(
+                        "username", username,
+                        "enabled", true,
+                        "email", username + "@raiji.com",
+                        "emailVerified", true,
+                        "firstName", "Usuario",
+                        "lastName", "Teste"))
+                .when().post(urlAdmin() + "/users")
+                .then().statusCode(201)
+                .extract().header("Location");
+
+        String userId = location.substring(location.lastIndexOf('/') + 1);
+
+        given()
+                .auth().oauth2(admin)
+                .contentType(ContentType.JSON)
+                .body(Map.of("type", "password", "value", SENHA_NOVOS_USUARIOS, "temporary", false))
+                .when().put(urlAdmin() + "/users/" + userId + "/reset-password")
+                .then().statusCode(204);
+
+        return userId;
+    }
+
+    @SuppressWarnings("unchecked")
+    protected static void atribuirRoleRealm(String userId, String role) {
+        String admin = tokenAdmin();
+
+        Map<String, Object> roleRep = given()
+                .auth().oauth2(admin)
+                .when().get(urlAdmin() + "/roles/" + role)
+                .then().statusCode(200)
+                .extract().as(Map.class);
+
+        given()
+                .auth().oauth2(admin)
+                .contentType(ContentType.JSON)
+                .body(List.of(roleRep))
+                .when().post(urlAdmin() + "/users/" + userId + "/role-mappings/realm")
+                .then().statusCode(204);
+    }
+
+    private static void habilitarServiceAccountAdmin() {
+        String admin = tokenAdmin();
+
+        given().contentType(ContentType.URLENC)
+                .formParam("grant_type", "client_credentials")
+                .formParam("client_id", "raiji-admin")
+                .formParam("client_secret", "raiji-admin-secret")
+                .when().post(urlToken())
+                .then().statusCode(200);
+
+        String serviceAccountId = given().auth().oauth2(admin)
+                .queryParam("username", "service-account-raiji-admin")
+                .queryParam("exact", true)
+                .when().get(urlAdmin() + "/users")
+                .then().statusCode(200)
+                .extract().path("[0].id");
+
+        String realmManagementId = given().auth().oauth2(admin)
+                .queryParam("clientId", "realm-management")
+                .when().get(urlAdmin() + "/clients")
+                .then().statusCode(200)
+                .extract().path("[0].id");
+
+        List<Map<String, Object>> roles = given().auth().oauth2(admin)
+                .when().get(urlAdmin() + "/clients/" + realmManagementId + "/roles")
+                .then().statusCode(200)
+                .extract().as(new TypeRef<>() {});
+
+        List<Map<String, Object>> desejadas = roles.stream()
+                .filter(r -> List.of("manage-users", "view-users", "query-users")
+                        .contains(r.get("name")))
+                .toList();
+
+        given().auth().oauth2(admin)
+                .contentType(ContentType.JSON)
+                .body(desejadas)
+                .when().post(urlAdmin() + "/users/" + serviceAccountId
+                        + "/role-mappings/clients/" + realmManagementId)
+                .then().statusCode(204);
+    }
+
+    protected static String adulterarAssinatura(String token) {
+        char[] caracteres = token.toCharArray();
+        int i = caracteres.length - 3;
+        caracteres[i] = (caracteres[i] == 'X') ? 'Y' : 'X';
+        return new String(caracteres);
+    }
+}
+
+===== ./raiji-app/src/test/java/com/raiji/it/TratamentoErrosApiIT.java =====
+package com.raiji.it;
+
+import static io.restassured.RestAssured.given;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Testes de API (§5) — tratamento de erros HTTP")
+class TratamentoErrosApiIT extends RaijiTestSupport {
+
+    @Test
+    @DisplayName("CT-021: rota inexistente (autenticado) → 404")
+    void ct021_naoEncontrado() {
+        given().auth().oauth2(obterToken(USUARIO_TESTE, SENHA_TESTE))
+                .when().get(app("/api/rota-inexistente"))
+                .then().statusCode(404);
+    }
+
+    @Test
+    @DisplayName("CT-022: método não suportado (PATCH /api/users/me) → 405")
+    void ct022_metodoNaoPermitido() {
+        given().auth().oauth2(obterToken(USUARIO_TESTE, SENHA_TESTE))
+                .when().patch(app("/api/users/me"))
+                .then().statusCode(405);
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/security/KeycloakAuthoritiesConverterTest.java =====
+package com.raiji.security;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.List;
+import java.util.Map;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.oauth2.jwt.Jwt;
+
+@DisplayName("Testes unitários (§4) — conversão das roles do JWT em authorities")
+class KeycloakAuthoritiesConverterTest {
+
+    private final KeycloakAuthoritiesConverter conversor =
+            new KeycloakAuthoritiesConverter("raiji-api");
+
+    private static Jwt jwt(Map<String, Object> claims) {
+        return Jwt.withTokenValue("t").header("alg", "RS256")
+                .claims(c -> c.putAll(claims)).build();
+    }
+
+    @Test
+    @DisplayName("CT-U06: realm roles ganham o prefixo ROLE_")
+    void realmRoles() {
+        var authorities = conversor.convert(jwt(
+                Map.of("sub", "user1", "realm_access", Map.of("roles", List.of("DRIVER", "admin")))));
+
+        assertThat(authorities).extracting(GrantedAuthority::getAuthority)
+                .containsExactlyInAnyOrder("ROLE_DRIVER", "ROLE_admin");
+    }
+
+    @Test
+    @DisplayName("CT-U07: client roles do client raiji-api são extraídas (de outros clients, não)")
+    void clientRoles() {
+        var jwt = jwt(Map.of("sub", "user1", "resource_access", Map.of(
+                "raiji-api", Map.of("roles", List.of("API_ROLE")),
+                "outro-client", Map.of("roles", List.of("IGNORADA")))));
+
+        assertThat(conversor.convert(jwt)).extracting(GrantedAuthority::getAuthority)
+                .containsExactly("ROLE_API_ROLE");
+    }
+
+    @Test
+    @DisplayName("CT-U08: token sem claims de roles → authorities vazias")
+    void semClaimsDeRoles() {
+        // O Spring Security 6+ exige que o Jwt tenha pelo menos um claim.
+        // Adicionamos "sub" para satisfazer a validação, mas sem as chaves de roles.
+        assertThat(conversor.convert(jwt(Map.of("sub", "usuario-teste")))).isEmpty();
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/users/dto/SetProfileRequestValidationTest.java =====
+package com.raiji.users.dto;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.raiji.users.domain.UserProfileType;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+@DisplayName("Testes unitários (§4) — validações do SetProfileRequest")
+class SetProfileRequestValidationTest {
+
+    private final Validator validador = Validation.buildDefaultValidatorFactory().getValidator();
+
+    @Test
+    @DisplayName("CT-U09: role nula viola @NotNull")
+    void roleNulaEInvalida() {
+        var violacoes = validador.validate(new SetProfileRequest(null));
+        assertThat(violacoes).hasSize(1);
+        assertThat(violacoes.iterator().next().getPropertyPath().toString()).isEqualTo("role");
+    }
+
+    @Test
+    @DisplayName("CT-U10: role válida não gera violações")
+    void roleValidaPassa() {
+        assertThat(validador.validate(new SetProfileRequest(UserProfileType.DRIVER))).isEmpty();
+    }
+}
+
+
+===== ./raiji-app/src/test/java/com/raiji/users/service/UserProvisioningServiceTest.java =====
+package com.raiji.users.service;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+import java.util.Optional;
+
+import com.raiji.users.domain.UserProfile;
+import com.raiji.users.domain.UserProfileType;
+import com.raiji.users.keycloak.KeycloakAdminService;
+import com.raiji.users.repository.UserProfileRepository;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.oauth2.jwt.Jwt;
+
+@ExtendWith(MockitoExtension.class)
+@DisplayName("Testes unitários (§4) — regras de perfil e provisionamento")
+class UserProvisioningServiceTest {
+
+    @Mock private UserProfileRepository repositorio;
+    @Mock private KeycloakAdminService keycloak;
+    @InjectMocks private UserProvisioningService servico;
+
+    private static Jwt jwt(String sub) {
+        return Jwt.withTokenValue("token-de-teste")
+                .header("alg", "RS256")
+                .claim("sub", sub)
+                .claim("email", sub + "@raiji.com")
+                .claim("name", "Usuário " + sub)
+                .build();
+    }
+
+    @Test
+    @DisplayName("CT-U01 (RN20): 1º acesso provisiona perfil com sub/e-mail/nome e sem tipo")
+    void provisionaNoPrimeiroAcesso() {
+        when(repositorio.findByKeycloakSub("sub-1")).thenReturn(Optional.empty());
+        when(repositorio.save(any(UserProfile.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        UserProfile perfil = servico.getOrProvision(jwt("sub-1"));
+
+        assertThat(perfil.getKeycloakSub()).isEqualTo("sub-1");
+        assertThat(perfil.getEmail()).isEqualTo("sub-1@raiji.com");
+        assertThat(perfil.getFullName()).isEqualTo("Usuário sub-1");
+        assertThat(perfil.getProfileType()).isNull();
+        verify(repositorio).save(any(UserProfile.class));
+    }
+
+    @Test
+    @DisplayName("CT-U02 (RN20): usuário já provisionado é reaproveitado (sem novo save)")
+    void naoReprovisiona() {
+        UserProfile existente = new UserProfile();
+        when(repositorio.findByKeycloakSub("sub-1")).thenReturn(Optional.of(existente));
+
+        assertThat(servico.getOrProvision(jwt("sub-1"))).isSameAs(existente);
+        verify(repositorio, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("CT-U03 (RN01/RF34): definir o 1º perfil atribui a realm role e persiste")
+    void definePrimeiroPerfil() {
+        UserProfile perfil = new UserProfile();
+        when(repositorio.findByKeycloakSub("sub-1")).thenReturn(Optional.of(perfil));
+        when(repositorio.save(perfil)).thenReturn(perfil);
+
+        servico.setProfile(jwt("sub-1"), UserProfileType.DRIVER);
+
+        verify(keycloak).assignRealmRole("sub-1", "DRIVER");
+        verify(keycloak, never()).removeRealmRole(anyString(), anyString());
+        assertThat(perfil.getProfileType()).isEqualTo(UserProfileType.DRIVER);
+    }
+
+    @Test
+    @DisplayName("CT-U04 (RF34): trocar de perfil remove a role antiga e atribui a nova")
+    void trocaDePerfil() {
+        UserProfile perfil = new UserProfile();
+        perfil.setProfileType(UserProfileType.PASSENGER);
+        when(repositorio.findByKeycloakSub("sub-1")).thenReturn(Optional.of(perfil));
+        when(repositorio.save(perfil)).thenReturn(perfil);
+
+        servico.setProfile(jwt("sub-1"), UserProfileType.DRIVER);
+
+        verify(keycloak).removeRealmRole("sub-1", "PASSENGER");
+        verify(keycloak).assignRealmRole("sub-1", "DRIVER");
+        assertThat(perfil.getProfileType()).isEqualTo(UserProfileType.DRIVER);
+    }
+
+    @Test
+    @DisplayName("CT-U05: reenviar o mesmo perfil é idempotente (sem chamadas ao Keycloak)")
+    void reenvioEIdempotente() {
+        UserProfile perfil = new UserProfile();
+        perfil.setProfileType(UserProfileType.DRIVER);
+        when(repositorio.findByKeycloakSub("sub-1")).thenReturn(Optional.of(perfil));
+
+        servico.setProfile(jwt("sub-1"), UserProfileType.DRIVER);
+
+        verifyNoInteractions(keycloak);
+        verify(repositorio, never()).save(any());
+    }
+}
+
+===== ./raiji-app/src/test/resources/docker-java.properties =====
+api.version=1.45
+
+
+===== ./raiji-app/src/test/resources/raiji-realm.json =====
+{
+  "realm": "raiji",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": true,
+  "resetPasswordAllowed": true,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "roles": {
+    "realm": [
+      { "name": "DRIVER" },
+      { "name": "PASSENGER" },
+      { "name": "admin" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "raiji-api",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:*"],
+      "webOrigins": ["+"],
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email", "basic"]
+    },
+    {
+      "clientId": "raiji-admin",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "raiji-admin-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-raiji-admin",
+      "enabled": true,
+      "serviceAccountClientId": "raiji-admin",
+      "clientRoles": {
+        "realm-management": [
+          "manage-users",
+          "view-users",
+          "query-users",
+          "view-realm"
+        ]
+      }
+    },
+    {
+      "username": "teste",
+      "enabled": true,
+      "email": "teste@raiji.com",
+      "emailVerified": true,
+      "firstName": "Usuario",
+      "lastName": "Teste",
+      "credentials": [
+        { "type": "password", "value": "teste123", "temporary": false }
+      ]
+    }
+  ]
+}
+
+===== ./raiji-common/pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.raiji</groupId>
+        <artifactId>raiji-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>raiji-common</artifactId>
+    <name>Raiji :: Common</name>
+</project>
+
+
+===== ./raiji-common/src/main/java/com/raiji/common/Roles.java =====
+package com.raiji.common;
+
+public final class Roles {
+    public static final String ADMIN = "admin";
+    public static final String DRIVER = "DRIVER";
+    public static final String PASSENGER = "PASSENGER";
+
+    private Roles() {
+    }
+}
+
+
+===== ./raiji-security/pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.raiji</groupId>
+        <artifactId>raiji-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>raiji-security</artifactId>
+    <name>Raiji :: Security</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.raiji</groupId>
+            <artifactId>raiji-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+    </dependencies>
+</project>
+
+
+===== ./raiji-security/src/main/java/com/raiji/security/KeycloakAuthoritiesConverter.java =====
+package com.raiji.security;
+
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import org.springframework.core.convert.converter.Converter;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.oauth2.jwt.Jwt;
+
+public final class KeycloakAuthoritiesConverter implements Converter<Jwt, Collection<GrantedAuthority>> {
+
+    private static final String ROLE_PREFIX = "ROLE_";
+    private final String apiClientId;
+
+    public KeycloakAuthoritiesConverter(String apiClientId) {
+        this.apiClientId = apiClientId;
+    }
+
+    @Override
+    public Collection<GrantedAuthority> convert(Jwt jwt) {
+        Set<GrantedAuthority> authorities = new HashSet<>();
+        addRoles(authorities, jwt.getClaimAsMap("realm_access"));
+
+        Map<String, Object> resourceAccess = jwt.getClaimAsMap("resource_access");
+        if (resourceAccess != null && resourceAccess.get(apiClientId) instanceof Map<?, ?> clientAccess) {
+            addRoles(authorities, castToMap(clientAccess));
+        }
+        return authorities;
+    }
+
+    private void addRoles(Set<GrantedAuthority> authorities, Map<String, Object> access) {
+        if (access == null || !(access.get("roles") instanceof Collection<?> roles)) {
+            return;
+        }
+        roles.stream()
+             .map(String::valueOf)
+             .map(role -> ROLE_PREFIX + role)
+             .map(SimpleGrantedAuthority::new)
+             .forEach(authorities::add);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> castToMap(Map<?, ?> map) {
+        return (Map<String, Object>) map;
+    }
+}
+
+
+===== ./raiji-security/src/main/java/com/raiji/security/SecurityConfig.java =====
+package com.raiji.security;
+
+import java.util.List;
+
+import com.raiji.common.Roles;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    private static final String API_CLIENT_ID = "raiji-api";
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                                                   JwtAuthenticationConverter jwtAuthenticationConverter) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**", "/actuator/health/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole(Roles.ADMIN)
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter)));
+        return http.build();
+    }
+
+    @Bean
+    public JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(new KeycloakAuthoritiesConverter(API_CLIENT_ID));
+        return converter;
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOriginPatterns(List.of("http://localhost:*"));
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+
+
+===== ./raiji-users/pom.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.raiji</groupId>
+        <artifactId>raiji-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>raiji-users</artifactId>
+    <name>Raiji :: Users</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.raiji</groupId>
+            <artifactId>raiji-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+</project>
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/domain/UserProfile.java =====
+package com.raiji.users.domain;
+
+import java.time.Instant;
+import java.util.UUID;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.PreUpdate;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "user_profiles")
+public class UserProfile {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(name = "keycloak_sub", nullable = false, unique = true, length = 64)
+    private String keycloakSub;
+
+    @Column(length = 160)
+    private String email;
+
+    @Column(name = "full_name", length = 160)
+    private String fullName;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "profile_type", length = 20)
+    private UserProfileType profileType;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @PrePersist
+    void onCreate() {
+        createdAt = Instant.now();
+        updatedAt = createdAt;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        updatedAt = Instant.now();
+    }
+
+    public UUID getId() { return id; }
+
+    public String getKeycloakSub() { return keycloakSub; }
+    public void setKeycloakSub(String keycloakSub) { this.keycloakSub = keycloakSub; }
+
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+
+    public String getFullName() { return fullName; }
+    public void setFullName(String fullName) { this.fullName = fullName; }
+
+    public UserProfileType getProfileType() { return profileType; }
+    public void setProfileType(UserProfileType profileType) { this.profileType = profileType; }
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/domain/UserProfileType.java =====
+package com.raiji.users.domain;
+
+public enum UserProfileType {
+    DRIVER,
+    PASSENGER
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/dto/SetProfileRequest.java =====
+package com.raiji.users.dto;
+
+import com.raiji.users.domain.UserProfileType;
+import jakarta.validation.constraints.NotNull;
+
+public record SetProfileRequest(@NotNull UserProfileType role) {
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/dto/UserProfileResponse.java =====
+package com.raiji.users.dto;
+
+import java.util.UUID;
+
+import com.raiji.users.domain.UserProfileType;
+
+public record UserProfileResponse(
+        UUID id,
+        String keycloakSub,
+        String email,
+        String fullName,
+        UserProfileType profileType,
+        boolean profileConfigured) {
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/keycloak/KeycloakAdminProperties.java =====
+package com.raiji.users.keycloak;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "raiji.keycloak")
+public record KeycloakAdminProperties(
+        String baseUrl,
+        String realm,
+        String adminClientId,
+        String adminClientSecret) {
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/keycloak/KeycloakAdminService.java =====
+package com.raiji.users.keycloak;
+
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestClient;
+
+@Service
+public class KeycloakAdminService {
+
+    private final KeycloakAdminProperties properties;
+    private final RestClient restClient;
+
+    public KeycloakAdminService(KeycloakAdminProperties properties) {
+        this.properties = properties;
+        this.restClient = RestClient.create();
+    }
+
+    public void assignRealmRole(String userId, String roleName) {
+        String token = adminToken();
+        Map<String, Object> role = fetchRealmRole(roleName, token);
+
+        restClient.put()
+                .uri(adminBaseUrl() + "/users/" + userId + "/role-mappings/realm")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(List.of(role))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    public void removeRealmRole(String userId, String roleName) {
+        String token = adminToken();
+        Map<String, Object> role = fetchRealmRole(roleName, token);
+
+        // CORREÇÃO: O método delete() padrão não aceita body.
+        // Usamos method(HttpMethod.DELETE) para obter um RequestBodySpec que aceita corpo.
+        restClient.method(HttpMethod.DELETE)
+                .uri(adminBaseUrl() + "/users/" + userId + "/role-mappings/realm")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(List.of(role))
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    private Map<String, Object> fetchRealmRole(String roleName, String adminToken) {
+        return restClient.get()
+                .uri(adminBaseUrl() + "/roles/" + roleName)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                .retrieve()
+                .body(new ParameterizedTypeReference<>() {
+                });
+    }
+
+    private String adminToken() {
+        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
+        form.add("grant_type", "client_credentials");
+        form.add("client_id", properties.adminClientId());
+        form.add("client_secret", properties.adminClientSecret());
+
+        Map<String, Object> response = restClient.post()
+                .uri(properties.baseUrl() + "/realms/" + properties.realm() + "/protocol/openid-connect/token")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(form)
+                .retrieve()
+                .body(new ParameterizedTypeReference<>() {
+                });
+
+        return (String) response.get("access_token");
+    }
+
+    private String adminBaseUrl() {
+        return properties.baseUrl() + "/admin/realms/" + properties.realm();
+    }
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/repository/UserProfileRepository.java =====
+package com.raiji.users.repository;
+
+import java.util.Optional;
+import java.util.UUID;
+
+import com.raiji.users.domain.UserProfile;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface UserProfileRepository extends JpaRepository<UserProfile, UUID> {
+    Optional<UserProfile> findByKeycloakSub(String keycloakSub);
+}
+
+
+===== ./raiji-users/src/main/java/com/raiji/users/service/UserProvisioningService.java =====
+package com.raiji.users.service;
+
+import com.raiji.users.domain.UserProfile;
+import com.raiji.users.domain.UserProfileType;
+import com.raiji.users.keycloak.KeycloakAdminService;
+import com.raiji.users.repository.UserProfileRepository;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class UserProvisioningService {
+
+    private final UserProfileRepository repository;
+    private final KeycloakAdminService keycloakAdminService;
+
+    public UserProvisioningService(UserProfileRepository repository,
+                                   KeycloakAdminService keycloakAdminService) {
+        this.repository = repository;
+        this.keycloakAdminService = keycloakAdminService;
+    }
+
+    @Transactional
+    public UserProfile getOrProvision(Jwt jwt) {
+        String sub = resolveSubject(jwt);
+        return repository.findByKeycloakSub(sub)
+                .orElseGet(() -> provision(jwt, sub));
+    }
+
+    @Transactional
+    public UserProfile setProfile(Jwt jwt, UserProfileType type) {
+        String sub = resolveSubject(jwt);
+        UserProfile profile = repository.findByKeycloakSub(sub)
+                .orElseGet(() -> provision(jwt, sub));
+
+        if (profile.getProfileType() == type) {
+            return profile;
+        }
+        if (profile.getProfileType() != null) {
+            keycloakAdminService.removeRealmRole(sub, profile.getProfileType().name());
+        }
+        keycloakAdminService.assignRealmRole(sub, type.name());
+
+        profile.setProfileType(type);
+        return repository.save(profile);
+    }
+
+    private UserProfile provision(Jwt jwt, String sub) {
+        UserProfile profile = new UserProfile();
+        profile.setKeycloakSub(sub);
+        profile.setEmail(jwt.getClaimAsString("email"));
+        profile.setFullName(jwt.getClaimAsString("name"));
+        return repository.save(profile);
+    }
+
+    private String resolveSubject(Jwt jwt) {
+        String sub = jwt.getSubject();
+        if (sub != null && !sub.isBlank()) {
+            return sub;
+        }
+
+        String username = jwt.getClaimAsString("preferred_username");
+        if (username != null && !username.isBlank()) {
+            return username;
+        }
+
+        throw new IllegalStateException(
+                "JWT não contém 'sub' nem 'preferred_username' — "
+                        + "verifique os protocol mappers do client 'raiji-api' no realm 'raiji'");
+    }
+}
+
+===== ./raiji-users/src/main/java/com/raiji/users/web/UserProfileController.java =====
+package com.raiji.users.web;
+
+import com.raiji.users.domain.UserProfile;
+import com.raiji.users.dto.SetProfileRequest;
+import com.raiji.users.dto.UserProfileResponse;
+import com.raiji.users.service.UserProvisioningService;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/users/me")
+public class UserProfileController {
+
+    private final UserProvisioningService provisioningService;
+
+    public UserProfileController(UserProvisioningService provisioningService) {
+        this.provisioningService = provisioningService;
+    }
+
+    @GetMapping
+    public UserProfileResponse me(@AuthenticationPrincipal Jwt jwt) {
+        return toResponse(provisioningService.getOrProvision(jwt));
+    }
+
+    @PostMapping("/profile")
+    public ResponseEntity<UserProfileResponse> setProfile(@AuthenticationPrincipal Jwt jwt,
+                                                          @Valid @RequestBody SetProfileRequest request) {
+        return ResponseEntity.ok(toResponse(provisioningService.setProfile(jwt, request.role())));
+    }
+
+    private UserProfileResponse toResponse(UserProfile profile) {
+        return new UserProfileResponse(
+                profile.getId(),
+                profile.getKeycloakSub(),
+                profile.getEmail(),
+                profile.getFullName(),
+                profile.getProfileType(),
+                profile.getProfileType() != null);
+    }
+}
+

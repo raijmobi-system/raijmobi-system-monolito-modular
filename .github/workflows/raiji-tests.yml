@@ -1,0 +1,39 @@
+name: Raiji — CI (testes automatizados)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 21 + cache do Maven
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Executar todos os testes + cobertura
+        run: mvn -B clean verify
+
+      - name: Exibir catálogo vivo da API no log
+        if: always()
+        run: cat raiji-app/target/api-catalog.txt || true
+
+      - name: Anexar relatórios (cobertura + resultados + catálogo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raiji-relatorios-de-teste
+          path: |
+            raiji-app/target/api-catalog.txt
+            raiji-app/target/site/jacoco-aggregate/**
+            **/target/surefire-reports/*.txt
+            **/target/failsafe-reports/*.txt
+          if-no-files-found: ignore
